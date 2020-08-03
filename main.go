@@ -97,9 +97,10 @@ func run(
 	logLevel string,
 ) error {
 	var logger *zap.Logger
+	var logLevelHandler zap.AtomicLevel
 	if logLevel != "none" {
 		var err error
-		logger, err = newLogger(logLevel)
+		logger, logLevelHandler, err = newLogger(logLevel)
 		if err != nil {
 			return fmt.Errorf("unable to create logger: %w", err)
 		}
@@ -167,6 +168,7 @@ func run(
 	group.Go(func() error {
 		router := mux.NewRouter()
 		router.Handle("/metrics", promhttp.Handler())
+		router.Handle("/log", logLevelHandler)
 		router.HandleFunc("/.stats", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			var groups = map[string]CacheGroup{
 				"avatars": stats(avatars),
@@ -300,7 +302,7 @@ func fetch(sem chan struct{}, urlFunc urlFunc, ttl time.Duration, log *zap.Logge
 	}
 }
 
-func newLogger(level string) (*zap.Logger, error) {
+func newLogger(level string) (*zap.Logger, zap.AtomicLevel, error) {
 	l := zapcore.Level(0)
 	if err := l.UnmarshalText([]byte(level)); err != nil {
 		l = zapcore.ErrorLevel
@@ -315,10 +317,10 @@ func newLogger(level string) (*zap.Logger, error) {
 
 	logger, err := cfg.Build()
 	if err != nil {
-		return nil, err
+		return nil, zap.AtomicLevel{}, err
 	}
 
-	return logger, nil
+	return logger, logLevel, nil
 }
 
 func stats(g *groupcache.Group) CacheGroup {
