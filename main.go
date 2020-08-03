@@ -2,29 +2,42 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io/ioutil"
 	"net/http"
 	"os"
-	"sync"
+	"os/signal"
 	"time"
 
 	"github.com/cenk/backoff"
+	"github.com/flga/jgx-imgproxy/prom"
 	"github.com/gorilla/handlers"
 	"github.com/gorilla/mux"
 	"github.com/mailgun/groupcache/v2"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
+	"golang.org/x/sync/errgroup"
 )
 
-var imgmu sync.RWMutex
-var imgCache = make(map[string][]byte)
-var pathmu sync.RWMutex
-var pathCache = make(map[string]string)
+type CacheStats struct {
+	Bytes     int64 `json:"bytes"`
+	Items     int64 `json:"items"`
+	Gets      int64 `json:"gets"`
+	Hits      int64 `json:"hits"`
+	Evictions int64 `json:"evictions"`
+}
+
+type CacheGroup struct {
+	Main CacheStats `json:"main"`
+	Hot  CacheStats `json:"hot"`
+}
 
 func main() {
 	listen := flag.String("listen", "localhost:8080", "host:port to listen on")
+	adminListen := flag.String("admin.listen", "localhost:6251", "host:port to listen on for admin stuff")
 	https := flag.Bool("https", false, "enable https")
 	cert := flag.String("cert", "", "cert file")
 	key := flag.String("key", "", "key file")
@@ -49,6 +62,7 @@ func main() {
 
 	if err := run(
 		*listen,
+		*adminListen,
 		*https,
 		*cert,
 		*key,
@@ -69,6 +83,7 @@ func main() {
 
 func run(
 	listen string,
+	adminListen string,
 	https bool,
 	cert, key string,
 	avatarConcurrency int,
@@ -119,24 +134,86 @@ func run(
 		),
 	)
 
-	router := mux.NewRouter()
-	router.HandleFunc("/m=avatar-rs/{player}/chat.png", handle("player", avatars, logger.Named("player-handler")))
-	router.HandleFunc("/m=avatar-rs/{clan}/clanmotif.png", handle("clan", clans, logger.Named("clan-handler")))
+	group, ctx := errgroup.WithContext(context.Background())
 
-	var handler http.Handler = router
-	if reqLog {
-		handler = handlers.CombinedLoggingHandler(os.Stdout, router)
-	}
-	if gzip {
-		handler = handlers.CompressHandler(handler)
-	}
+	// api server
+	group.Go(func() error {
+		router := mux.NewRouter()
+		router.Use(prom.Handler)
+		router.HandleFunc("/m=avatar-rs/{player}/chat.png", handle("player", avatars, logger.Named("player-handler")))
+		router.HandleFunc("/m=avatar-rs/{clan}/clanmotif.png", handle("clan", clans, logger.Named("clan-handler")))
 
-	logger.Info("starting server", zap.String("address", listen), zap.Bool("https", https))
-	if https {
-		return http.ListenAndServeTLS(listen, cert, key, handler)
-	}
+		var handler http.Handler = router
+		if reqLog {
+			handler = handlers.CombinedLoggingHandler(os.Stdout, router)
+		}
+		if gzip {
+			handler = handlers.CompressHandler(handler)
+		}
 
-	return http.ListenAndServe(listen, handler)
+		server := &http.Server{
+			Addr:    listen,
+			Handler: handler,
+		}
+
+		logger.Info("starting server", zap.String("address", listen), zap.Bool("https", https))
+		if https {
+			return startServerTLS(ctx, server, listen, cert, key, 30*time.Second, logger.Named("api"))
+		}
+		return startServer(ctx, server, listen, 30*time.Second, logger.Named("api"))
+	})
+
+	// admin server
+	group.Go(func() error {
+		router := mux.NewRouter()
+		router.Handle("/metrics", promhttp.Handler())
+		router.HandleFunc("/.stats", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			var groups = map[string]CacheGroup{
+				"avatars": stats(avatars),
+				"clans":   stats(clans),
+			}
+
+			d, err := json.Marshal(groups)
+			if err != nil {
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+
+			w.Write(d)
+		}))
+
+		var handler http.Handler = router
+		if reqLog {
+			handler = handlers.CombinedLoggingHandler(os.Stdout, router)
+		}
+		if gzip {
+			handler = handlers.CompressHandler(handler)
+		}
+
+		server := &http.Server{
+			Addr:    adminListen,
+			Handler: router,
+		}
+
+		logger.Info("starting admin server", zap.String("address", adminListen))
+		return startServer(ctx, server, adminListen, 30*time.Second, logger.Named("admin"))
+	})
+
+	// signal handler
+	group.Go(func() error {
+		logger.Info("listening")
+		sigc := make(chan os.Signal)
+		signal.Notify(sigc, os.Interrupt, os.Kill)
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case s := <-sigc:
+			return fmt.Errorf("received signal %s", s)
+		}
+	})
+
+	return group.Wait()
 }
 
 func handle(keyName string, cache *groupcache.Group, log *zap.Logger) http.HandlerFunc {
@@ -242,4 +319,86 @@ func newLogger(level string) (*zap.Logger, error) {
 	}
 
 	return logger, nil
+}
+
+func stats(g *groupcache.Group) CacheGroup {
+	var group CacheGroup
+
+	main := g.CacheStats(groupcache.MainCache)
+	group.Main = CacheStats{
+		Bytes:     main.Bytes,
+		Items:     main.Items,
+		Gets:      main.Gets,
+		Hits:      main.Hits,
+		Evictions: main.Evictions,
+	}
+
+	hot := g.CacheStats(groupcache.HotCache)
+	group.Hot = CacheStats{
+		Bytes:     hot.Bytes,
+		Items:     hot.Items,
+		Gets:      hot.Gets,
+		Hits:      hot.Hits,
+		Evictions: hot.Evictions,
+	}
+
+	return group
+}
+
+func startServer(ctx context.Context, srv *http.Server, addr string, gracefulShutdownTimeout time.Duration, logger *zap.Logger) error {
+	errc := make(chan error)
+	shutdown := make(chan struct{})
+	go func() {
+		<-ctx.Done()
+
+		timeout, cancel := context.WithTimeout(context.Background(), gracefulShutdownTimeout)
+		defer cancel()
+
+		logger.Info("starting shutdown process", zap.Duration("timeout", gracefulShutdownTimeout))
+
+		err := srv.Shutdown(timeout)
+		if err != nil {
+			logger.Error("unclean shutdown", zap.Error(err))
+		} else {
+			logger.Info("shutdown complete")
+		}
+		close(shutdown)
+		errc <- err
+	}()
+
+	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		return err
+	}
+
+	<-shutdown
+	return <-errc
+}
+
+func startServerTLS(ctx context.Context, srv *http.Server, addr, cert, key string, gracefulShutdownTimeout time.Duration, logger *zap.Logger) error {
+	errc := make(chan error)
+	shutdown := make(chan struct{})
+	go func() {
+		<-ctx.Done()
+
+		timeout, cancel := context.WithTimeout(context.Background(), gracefulShutdownTimeout)
+		defer cancel()
+
+		logger.Info("starting shutdown process", zap.Duration("timeout", gracefulShutdownTimeout))
+
+		err := srv.Shutdown(timeout)
+		if err != nil {
+			logger.Error("unclean shutdown", zap.Error(err))
+		} else {
+			logger.Info("shutdown complete")
+		}
+		close(shutdown)
+		errc <- err
+	}()
+
+	if err := srv.ListenAndServeTLS(cert, key); err != nil && err != http.ErrServerClosed {
+		return err
+	}
+
+	<-shutdown
+	return <-errc
 }
